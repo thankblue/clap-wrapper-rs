@@ -190,6 +190,9 @@ fn build_auv2(debug: bool, clap_wrapper_dir: &Path) {
         clap_wrapper_dir.join("src/clap_proxy.cpp"),
         clap_wrapper_dir.join("src/detail/clap/fsutil.cpp"),
         clap_wrapper_dir.join("src/detail/shared/sha1.cpp"),
+        // v0.17.0 added preset discovery (Clap::PresetIndex/PresetEntry), used by
+        // wrapasauv2.cpp since the preset-publication commits (#564/#578).
+        clap_wrapper_dir.join("src/detail/clap/preset_discovery.cpp"),
     ]);
 
     // clap auv2 wrapper
