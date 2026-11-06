@@ -1,6 +1,6 @@
 #pragma once
 #include "detail/auv2/auv2_base_classes.h"
-#include "s238_bypass_direct.hxx"
+#include "s239_bypass_direct.hxx"
 
 // The instance classes gain one more layer (nice_s238::BypassDirect) between them and
 // WrapAsAUV2; see that file for what it adds and why it can live entirely in this repository.
