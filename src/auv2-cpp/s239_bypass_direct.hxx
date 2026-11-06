@@ -153,6 +153,8 @@ class BypassDirect : public Base
       : Base(clapname, clapid, idx, ci)
   {
     note(Counter_InstancesBuilt);
+    // §253 台架专用开关，构造期（主线程）读一次；见下面 Render() 的说明。未置位＝零行为。
+    probeFlushOnRender = std::getenv("NICE_AU_PROBE_FLUSH_EVERY_RENDER") != nullptr;
   }
 
   // §239 甲-1：不再依赖 setupWrapperSpecifics 取 clap_plugin_t*（那条路在构造期虚分派，
@@ -213,6 +215,22 @@ class BypassDirect : public Base
       note(Counter_SetPropertyBypassEntered);
     }
     return Base::SetProperty(inID, inScope, inElement, inData, inDataSize);
+  }
+
+  // §253 台架专用（环境变量 NICE_AU_PROBE_FLUSH_EVERY_RENDER）：无头宿主里没有 GUI，也不会
+  // 产生生产路径的 request_flush。置位时在**每次** Render 之后调用同一个生产虚函数
+  // param_request_flush()——面板侧的值已经由插件的探针入口落好（hint，可选再加参数对象），
+  // 这一句就是真面板路径走完写入之后宿主层要做的那件事。环境变量未置位＝零行为；
+  // 净修法 commit（de876eb）不含本函数，落 main 的 pin 也不含。
+  OSStatus Render(AudioUnitRenderActionFlags &inFlags, const AudioTimeStamp &inTimeStamp,
+                  UInt32 inFrames) override
+  {
+    const OSStatus status = Base::Render(inFlags, inTimeStamp, inFrames);
+    if (probeFlushOnRender)
+    {
+      this->param_request_flush();
+    }
+    return status;
   }
 
   // Plugin -> host. nice-plug calls this from the editor's parameter write, on the main thread.
@@ -433,6 +451,8 @@ class BypassDirect : public Base
   std::atomic<bool> fHostWriteSeen{true};
   std::atomic<double> fLastNotifiedValue{-2.0};    // §251：上次通报的 bypass 值
   std::atomic<double> fLastNotifiedPowerValue{-2.0}; // §251：上次通报的 Power 值
+  // §253 台架专用：见上面 Render()。产品路径永远为 false（环境变量不设）。
+  bool probeFlushOnRender{false};
 };
 
 } // namespace nice_s238
