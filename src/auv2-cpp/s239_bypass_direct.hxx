@@ -201,6 +201,44 @@ class BypassDirect : public Base
     return status;
   }
 
+  // §262 K2：AU 枚举序把 Power 置首位（对照 BiG：Power pos=0）。
+  //
+  // §262 字面落点是 WrapAsAUV2 的 `_orderedParameterList`＋`_paramOrderingProvided=true`，
+  // 但这两个成员在 external/clap-wrapper 的 private 区（auv2_base_classes.h:849/989-990），
+  // 而本轮硬约束 external/ 零行——故在 fork 自有 mixin 层覆写公开虚函数 GetParameterList，
+  // 宿主可见行为与字面落点等价：返回的列表 Power 在首位、其余相对序不变。
+  // flag 的三处引用（wrapasauv2.cpp:565/616/666）与查找全走 paramID 均已核（§260），
+  // 排序只影响显示/枚举，不影响 SetParameter/事件/GetParameterInfo 的寻址。
+  //
+  // 实现只动调用方缓冲，不碰共享态；fPowerID 在 Initialize→arm()（主线程）落定，
+  // 早于宿主任何属性查询。arm() 自身也调 GetParameterList，但那时 fPowerID 尚未落定，
+  // 走直通分支；且 arm() 按显示名认参，与顺序无关。尺寸查询（outParameterList==nullptr）
+  // 直通。未认到 Power 或 Power 已在首位＝零行为。
+  OSStatus GetParameterList(AudioUnitScope inScope, AudioUnitParameterID *outParameterList,
+                            UInt32 &outNumParameters) override
+  {
+    const OSStatus status = Base::GetParameterList(inScope, outParameterList, outNumParameters);
+    if (status != noErr || inScope != kAudioUnitScope_Global ||
+        fPowerID == CLAP_INVALID_ID || outParameterList == nullptr)
+    {
+      return status;
+    }
+    UInt32 pos = outNumParameters;
+    for (UInt32 i = 0; i < outNumParameters; ++i)
+    {
+      if (outParameterList[i] == static_cast<AudioUnitParameterID>(fPowerID))
+      {
+        pos = i;
+        break;
+      }
+    }
+    if (pos == 0 || pos == outNumParameters) return noErr;
+    const AudioUnitParameterID powerID = outParameterList[pos];
+    for (UInt32 i = pos; i > 0; --i) outParameterList[i] = outParameterList[i - 1];
+    outParameterList[0] = powerID;
+    return noErr;
+  }
+
   // §245：宿主对 AU 说「旁通」的方式是 kAudioUnitProperty_BypassEffect。基类的
   // SetBypassEffect() 不是虚函数，但它最终走上面的 SetParameter()；这里再把属性入口
   // 单独记一格，两者都能在台架上读到。（只记，不改语义。）
