@@ -141,8 +141,16 @@ class BypassDirect : public Base
     return status;
   }
 
-  // Plugin -> host. nice-plug calls this from the editor's parameter write, on the main thread,
-  // right after the plugin's own value has changed. The base's deferral is left fully in place.
+  // Plugin -> host. nice-plug calls this from the editor's parameter write, on the main thread.
+  // The base's deferral is left fully in place.
+  //
+  // Contract this path relies on: by the time the plugin asks for a flush, its own
+  // `params.get_value` already answers with the new value. A CLAP plugin that only applies the
+  // value when it drains the output queue at the next flush will simply be seen as "no
+  // divergence" here and nothing is sent - the wrapper does not guess. nice-plug 0.4.2 queues
+  // the editor's write (wrapper/clap/context.rs:568-572: "the parameter's actual value will only
+  // be changed when the output event is written"), so the ai-mastering panel applies it up
+  // front as well; see handoffs §238.
   void param_request_flush() override
   {
     Base::param_request_flush();
