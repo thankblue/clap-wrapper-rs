@@ -151,6 +151,8 @@ class BypassDirect : public Base
       : Base(clapname, clapid, idx, ci)
   {
     note(Counter_InstancesBuilt);
+    // §253 台架专用开关（负控构建），构造期（主线程）读一次；见下面 Render() 的说明。
+    probeFlushOnRender = std::getenv("NICE_AU_PROBE_FLUSH_EVERY_RENDER") != nullptr;
   }
 
   // §239 甲-1：不再依赖 setupWrapperSpecifics 取 clap_plugin_t*（那条路在构造期虚分派，
@@ -199,6 +201,19 @@ class BypassDirect : public Base
       note(Counter_SetPropertyBypassEntered);
     }
     return Base::SetProperty(inID, inScope, inElement, inData, inDataSize);
+  }
+
+  // §253 台架专用（环境变量 NICE_AU_PROBE_FLUSH_EVERY_RENDER）：与 s253-bench 上的同一把
+  // 钩子，只落在负控构建上，用来把「缺口 A 修法之前」的面板路行为量出来。未置位＝零行为。
+  OSStatus Render(AudioUnitRenderActionFlags &inFlags, const AudioTimeStamp &inTimeStamp,
+                  UInt32 inFrames) override
+  {
+    const OSStatus status = Base::Render(inFlags, inTimeStamp, inFrames);
+    if (probeFlushOnRender)
+    {
+      this->param_request_flush();
+    }
+    return status;
   }
 
   // Plugin -> host. nice-plug calls this from the editor's parameter write, on the main thread.
@@ -377,6 +392,8 @@ class BypassDirect : public Base
   std::atomic<bool> fArmed{false};
   std::atomic<double> fHostWriteValue{0.0};
   std::atomic<bool> fHostWriteSeen{true};
+  // §253 台架专用（负控构建）：见上面 Render()。产品路径永远为 false。
+  bool probeFlushOnRender{false};
 };
 
 } // namespace nice_s238
