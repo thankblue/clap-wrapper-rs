@@ -90,7 +90,9 @@ enum Counter : uint32_t
   Counter_SetParamBypassEntered = 15,   // SetParameter() 收到 bypass 参数写（宿主→插件）
   Counter_SetPropertyBypassEntered = 16, // SetProperty(BypassEffect) 进门（宿主→wrapper）
   Counter_HintPulled = 17,           // hint 三元读取一致（fork 侧成功拉取次数）
-  Counter_Count = 18
+  Counter_PowerParamFound = 18,      // §251：Power 镜像参按名认出
+  Counter_PowerDirectSent = 19,      // §251：Power 镜像参直发通报发出
+  Counter_Count = 20
 };
 
 inline std::atomic<uint64_t> &counter(uint32_t index)
@@ -166,7 +168,10 @@ class BypassDirect : public Base
   void Cleanup() override
   {
     fBypassID = CLAP_INVALID_ID;
+    fPowerID = CLAP_INVALID_ID;
     fArmed.store(false, std::memory_order_relaxed);
+    fLastNotifiedValue.store(-2.0, std::memory_order_relaxed);
+    fLastNotifiedPowerValue.store(-2.0, std::memory_order_relaxed);
     Base::Cleanup();
   }
 
@@ -177,12 +182,21 @@ class BypassDirect : public Base
     const OSStatus status =
         Base::SetParameter(inID, inScope, inElement, inValue, inBufferOffsetInFrames);
 
-    if (inScope == kAudioUnitScope_Global && inID == fBypassID && fBypassID != CLAP_INVALID_ID)
+    if (inScope == kAudioUnitScope_Global && fBypassID != CLAP_INVALID_ID)
     {
-      // §245：宿主→插件方向的 bypass 参数写进门（SetBypassEffect 也会落到这里）。
-      note(Counter_SetParamBypassEntered);
-      fHostWriteValue.store(static_cast<double>(inValue), std::memory_order_relaxed);
-      fHostWriteSeen.store(false, std::memory_order_relaxed);
+      if (inID == fBypassID)
+      {
+        // §245：宿主→插件方向的 bypass 参数写进门（SetBypassEffect 也会落到这里）。
+        note(Counter_SetParamBypassEntered);
+        fHostWriteValue.store(static_cast<double>(inValue), std::memory_order_relaxed);
+        fHostWriteSeen.store(false, std::memory_order_relaxed);
+      }
+      else if (inID == fPowerID && fPowerID != CLAP_INVALID_ID)
+      {
+        // §251：宿主写 Power 镜像参——换算成 bypass 等价值（Power = !bypass）。
+        fHostWriteValue.store(1.0 - static_cast<double>(inValue), std::memory_order_relaxed);
+        fHostWriteSeen.store(false, std::memory_order_relaxed);
+      }
     }
     return status;
   }
@@ -258,6 +272,8 @@ class BypassDirect : public Base
 
     // 遍历参数列表。名字只认 cfNameString：name 字段按契约被包装层清零
     // （wrapasauv2.cpp 的 memset；SDK 注释 "name — UNUSED - set to zero"）。
+    // §251：同时找 "Power" 镜像参（宿主对非活动单元仍服务的普通参通道）。
+    const uint32_t powerHash = fnv1a_64_low32("Power");
     for (AudioUnitParameterID paramID : paramList)
     {
       AudioUnitParameterInfo paramInfo;
@@ -275,7 +291,7 @@ class BypassDirect : public Base
       }
 
       // clap-wrapper 对该字段每次都 CFRetain；带 CFNameRelease 标志就必须由我们释放，
-      // 否则每次 Initialize 泄漏 37 个 CFString。
+      // 否则每次 Initialize 泄漏 38 个 CFString（36 旋钮 + bypass + power）。
       const bool release = (paramInfo.flags & kAudioUnitParameterFlag_CFNameRelease) != 0;
       char nameBuf[256];
       nameBuf[0] = 0;
@@ -289,11 +305,18 @@ class BypassDirect : public Base
         continue;
       }
 
-      if (fnv1a_64_low32(nameBuf) == BYPASS_DISPLAY_NAME_HASH)
+      const uint32_t nameHash = fnv1a_64_low32(nameBuf);
+      if (fBypassID == CLAP_INVALID_ID && nameHash == BYPASS_DISPLAY_NAME_HASH)
       {
         fBypassID = paramID;
-        break;
       }
+      else if (fPowerID == CLAP_INVALID_ID && nameHash == powerHash)
+      {
+        fPowerID = paramID;
+        note(Counter_PowerParamFound);
+      }
+      // 两个都找到就提前退出
+      if (fBypassID != CLAP_INVALID_ID && fPowerID != CLAP_INVALID_ID) break;
     }
 
     if (fBypassID == CLAP_INVALID_ID)
@@ -302,6 +325,9 @@ class BypassDirect : public Base
       return;
     }
 
+    // §251：初始化通报基线为「不可能值」，确保首次翻转一定触发通报。
+    fLastNotifiedValue.store(-2.0, std::memory_order_relaxed);
+    fLastNotifiedPowerValue.store(-2.0, std::memory_order_relaxed);
     fHostWriteSeen.store(true, std::memory_order_relaxed);
     fArmed.store(true, std::memory_order_relaxed);
     note(Counter_Armed);
@@ -342,7 +368,12 @@ class BypassDirect : public Base
     }
     double pluginValue = static_cast<double>(pluginValueFloat);
 
-    const double auValue = static_cast<double>(this->Globals()->GetParameter(fBypassID));
+    // §251 缺口 A 修法：比对基线改「上次已通报值」，不再读 AU 参数现值。
+    // 原因：editor.rs 的 apply_bypass() 先调 _internal_set_plain_value() 把新值写入
+    // 参数对象，再调 param_request_flush()；fork 读 Globals()->GetParameter() 拿到的是
+    // 已更新的值，与 pluginValue 恒等，导致 AlreadyKnown 吞掉通报。改为追踪上次成功
+    // 通报的值，每次翻转 pluginValue != fLastNotifiedValue 恒成立。
+    const double lastNotified = fLastNotifiedValue.load(std::memory_order_relaxed);
 
     const bool sawHostWrite = !fHostWriteSeen.exchange(true, std::memory_order_relaxed);
     if (sawHostWrite && pluginValue != fHostWriteValue.load(std::memory_order_relaxed))
@@ -351,12 +382,13 @@ class BypassDirect : public Base
       return;
     }
 
-    if (pluginValue == auValue)
+    if (pluginValue == lastNotified)
     {
       note(Counter_AlreadyKnown);
       return;
     }
 
+    // 通报 bypass 参数
     clap_event_param_value_t event{};
     event.header.size = sizeof(event);
     event.header.time = 0;
@@ -371,12 +403,36 @@ class BypassDirect : public Base
 
     this->PropertyChanged(kAudioUnitProperty_BypassEffect, kAudioUnitScope_Global, 0);
     note(Counter_PropertyChanged);
+
+    // §251：同时通报 Power 镜像参（普通参，宿主对非活动单元仍服务）。
+    // Power = !bypass：Power 开 = 非旁路 = pluginValue == 0.0
+    if (fPowerID != CLAP_INVALID_ID)
+    {
+      const double powerValue = 1.0 - pluginValue;
+      clap_event_param_value_t powerEvent{};
+      powerEvent.header.size = sizeof(powerEvent);
+      powerEvent.header.time = 0;
+      powerEvent.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+      powerEvent.header.type = CLAP_EVENT_PARAM_VALUE;
+      powerEvent.header.flags = 0;
+      powerEvent.param_id = fPowerID;
+      powerEvent.value = powerValue;
+      this->onPerformEdit(&powerEvent);
+      note(Counter_PowerDirectSent);
+    }
+
+    // 更新通报基线
+    fLastNotifiedValue.store(pluginValue, std::memory_order_relaxed);
+    fLastNotifiedPowerValue.store(1.0 - pluginValue, std::memory_order_relaxed);
   }
 
   clap_id fBypassID{CLAP_INVALID_ID};
+  clap_id fPowerID{CLAP_INVALID_ID};              // §251：Power 镜像参 ID
   std::atomic<bool> fArmed{false};
   std::atomic<double> fHostWriteValue{0.0};
   std::atomic<bool> fHostWriteSeen{true};
+  std::atomic<double> fLastNotifiedValue{-2.0};    // §251：上次通报的 bypass 值
+  std::atomic<double> fLastNotifiedPowerValue{-2.0}; // §251：上次通报的 Power 值
 };
 
 } // namespace nice_s238
