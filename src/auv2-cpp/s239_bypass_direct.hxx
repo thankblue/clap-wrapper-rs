@@ -69,12 +69,13 @@ enum Counter : uint32_t
   Counter_NoBypassParam = 2,        // 没扫到显示名匹配的 bypass 参数
   Counter_HintSymbolsMissing = 3,   // weak extern 解析失败（hint 模块未链接）
   Counter_HintReadInconsistent = 4, // 读 hint 时 seq 变了，重试后仍不一致
-  Counter_AlreadyKnown = 5,         // 插件值 == AU 值，宿主已经知道，不发
-  Counter_DirectSent = 6,           // 直发触发：Globals()->SetParameter + 参数变化事件
-  Counter_PropertyChanged = 7,      // kAudioUnitProperty_BypassEffect 发出
-  Counter_Armed = 8,                // Initialize() 里建档次数
-  Counter_InstancesBuilt = 9,       // 经本 mixin 构造出来的 AU 实例数
-  Counter_Count = 10
+  Counter_HostMoveInWindow = 5,     // 分歧来自宿主这一侧（防把宿主刚写的值倒灌回去），跳过
+  Counter_AlreadyKnown = 6,         // 插件值 == AU 值，宿主已经知道，不发
+  Counter_DirectSent = 7,           // 直发触发：Globals()->SetParameter + 参数变化事件
+  Counter_PropertyChanged = 8,      // kAudioUnitProperty_BypassEffect 发出
+  Counter_Armed = 9,                // Initialize() 里建档次数
+  Counter_InstancesBuilt = 10,      // 经本 mixin 构造出来的 AU 实例数
+  Counter_Count = 11
 };
 
 inline std::atomic<uint64_t> &counter(uint32_t index)
@@ -203,7 +204,7 @@ class BypassDirect : public Base
     // 现在用 GetParameterList 找显示名为 "Bypass" 的参数 ID。
     // AUv2 的 GetParameterList 返回所有参数 ID 列表。
     UInt32 paramListSize = 0;
-    OSStatus err = this->GetParameterList(kAudioUnitScope_Global, nullptr, &paramListSize);
+    OSStatus err = this->GetParameterList(kAudioUnitScope_Global, nullptr, paramListSize);
     if (err != noErr || paramListSize == 0)
     {
       note(Counter_NoBypassParam);
@@ -211,7 +212,7 @@ class BypassDirect : public Base
     }
 
     std::vector<AudioUnitParameterID> paramList(paramListSize);
-    err = this->GetParameterList(kAudioUnitScope_Global, paramList.data(), &paramListSize);
+    err = this->GetParameterList(kAudioUnitScope_Global, paramList.data(), paramListSize);
     if (err != noErr)
     {
       note(Counter_NoBypassParam);
@@ -222,8 +223,7 @@ class BypassDirect : public Base
     for (AudioUnitParameterID paramID : paramList)
     {
       AudioUnitParameterInfo paramInfo;
-      UInt32 infoSize = sizeof(paramInfo);
-      err = this->GetParameterInfo(kAudioUnitScope_Global, paramID, &paramInfo);
+      err = this->GetParameterInfo(kAudioUnitScope_Global, paramID, paramInfo);
       if (err != noErr) continue;
 
       // 计算显示名的 FNV-1a 哈希（低 32 位）。
