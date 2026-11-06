@@ -32,8 +32,12 @@
 
 #include <pthread.h>
 
+#include <CoreFoundation/CoreFoundation.h>
+
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -62,20 +66,31 @@ namespace nice_s238
 constexpr uint32_t BYPASS_DISPLAY_NAME_HASH = 0x0146944d;
 
 // TEMPORARY(§237.1): fork 侧计数，由 Rust 探针读走写进同一份探针日志。§218 关账后删除。
+//
+// §245：认参失败要能分格（清单中心＝认参），所以原来的 Counter_NoBypassParam 拆成
+// get-list 失败／GetParameterInfo 失败／cfNameString 缺失／名字不匹配四格；另加宿主写
+// 进门两格（SetParameter(bypass) 与 SetProperty(BypassEffect)）与 hint 成功拉取一格。
 enum Counter : uint32_t
 {
-  Counter_RequestFlushEntered = 0,  // param_request_flush() 进门次数
-  Counter_NotMainThread = 1,        // 因不在主线程而跳过
-  Counter_NoBypassParam = 2,        // 没扫到显示名匹配的 bypass 参数
-  Counter_HintSymbolsMissing = 3,   // weak extern 解析失败（hint 模块未链接）
-  Counter_HintReadInconsistent = 4, // 读 hint 时 seq 变了，重试后仍不一致
-  Counter_HostMoveInWindow = 5,     // 分歧来自宿主这一侧（防把宿主刚写的值倒灌回去），跳过
-  Counter_AlreadyKnown = 6,         // 插件值 == AU 值，宿主已经知道，不发
-  Counter_DirectSent = 7,           // 直发触发：Globals()->SetParameter + 参数变化事件
-  Counter_PropertyChanged = 8,      // kAudioUnitProperty_BypassEffect 发出
-  Counter_Armed = 9,                // Initialize() 里建档次数
-  Counter_InstancesBuilt = 10,      // 经本 mixin 构造出来的 AU 实例数
-  Counter_Count = 11
+  Counter_RequestFlushEntered = 0,   // param_request_flush() 进门次数
+  Counter_NotMainThread = 1,         // 因不在主线程而跳过
+  Counter_GetListFailed = 2,         // GetParameterList 取不到列表
+  Counter_GetInfoFailed = 3,         // GetParameterInfo 对某个参数返回错误
+  Counter_CfNameMissing = 4,         // cfNameString 为空（或转不了 UTF-8）
+  Counter_NameNoMatch = 5,           // 名字哈希没有一个对上
+  Counter_HintIdMismatch = 6,        // hint 的标识不是我们认识的 bypass
+  Counter_HintSymbolsMissing = 7,    // weak extern 解析失败（hint 模块未链接）
+  Counter_HintReadInconsistent = 8,  // 读 hint 时 seq 变了，重试后仍不一致
+  Counter_HostMoveInWindow = 9,      // 分歧来自宿主这一侧（防把宿主刚写的值倒灌回去），跳过
+  Counter_AlreadyKnown = 10,         // 插件值 == AU 值，宿主已经知道，不发
+  Counter_DirectSent = 11,           // 直发触发：onPerformEdit + 参数变化事件
+  Counter_PropertyChanged = 12,      // kAudioUnitProperty_BypassEffect 发出
+  Counter_Armed = 13,                // Initialize() 里建档次数
+  Counter_InstancesBuilt = 14,       // 经本 mixin 构造出来的 AU 实例数
+  Counter_SetParamBypassEntered = 15,   // SetParameter() 收到 bypass 参数写（宿主→插件）
+  Counter_SetPropertyBypassEntered = 16, // SetProperty(BypassEffect) 进门（宿主→wrapper）
+  Counter_HintPulled = 17,           // hint 三元读取一致（fork 侧成功拉取次数）
+  Counter_Count = 18
 };
 
 inline std::atomic<uint64_t> &counter(uint32_t index)
@@ -116,6 +131,8 @@ inline bool readHintConsistent(uint32_t &outId, float &outValue)
     {
       outId = id;
       outValue = value;
+      // §245：同一次一致读取在 arm 与直发里都发生；两处都算「fork 拉到了 hint」。
+      note(Counter_HintPulled);
       return true;
     }
     // seq 变了，重试。
@@ -162,10 +179,26 @@ class BypassDirect : public Base
 
     if (inScope == kAudioUnitScope_Global && inID == fBypassID && fBypassID != CLAP_INVALID_ID)
     {
+      // §245：宿主→插件方向的 bypass 参数写进门（SetBypassEffect 也会落到这里）。
+      note(Counter_SetParamBypassEntered);
       fHostWriteValue.store(static_cast<double>(inValue), std::memory_order_relaxed);
       fHostWriteSeen.store(false, std::memory_order_relaxed);
     }
     return status;
+  }
+
+  // §245：宿主对 AU 说「旁通」的方式是 kAudioUnitProperty_BypassEffect。基类的
+  // SetBypassEffect() 不是虚函数，但它最终走上面的 SetParameter()；这里再把属性入口
+  // 单独记一格，两者都能在台架上读到。（只记，不改语义。）
+  OSStatus SetProperty(AudioUnitPropertyID inID, AudioUnitScope inScope,
+                       AudioUnitElement inElement, const void *inData,
+                       UInt32 inDataSize) override
+  {
+    if (inID == kAudioUnitProperty_BypassEffect && inScope == kAudioUnitScope_Global)
+    {
+      note(Counter_SetPropertyBypassEntered);
+    }
+    return Base::SetProperty(inID, inScope, inElement, inData, inDataSize);
   }
 
   // Plugin -> host. nice-plug calls this from the editor's parameter write, on the main thread.
@@ -176,7 +209,11 @@ class BypassDirect : public Base
   }
 
  private:
-  // §239 甲-1：用 GetParameterList/GetParameterInfo 按显示名哈希认 bypass。
+  // §245：用 GetParameterList/GetParameterInfo 按显示名哈希认 bypass。
+  //
+  // §244 无头枚举钉死两处缺陷：①AUv2 的 AudioUnitParameterInfo.name 按 API 契约恒为空，
+  // 名字只在 cfNameString（clap-wrapper 每次调用都会 CFRetain 它）；②hint 常量是
+  // FNV-1a **64** 的低 32 位，不是 32 位算法。修法只订正这两个字段/宽度，机制形状不变。
   void arm()
   {
     // 先检查 hint 符号是否可用。
@@ -197,7 +234,7 @@ class BypassDirect : public Base
     if (hintId != BYPASS_DISPLAY_NAME_HASH)
     {
       // 显示名哈希不匹配，不是我们认识的 bypass 参数，路径惰性。
-      note(Counter_NoBypassParam);
+      note(Counter_HintIdMismatch);
       return;
     }
 
@@ -207,7 +244,7 @@ class BypassDirect : public Base
     OSStatus err = this->GetParameterList(kAudioUnitScope_Global, nullptr, paramListSize);
     if (err != noErr || paramListSize == 0)
     {
-      note(Counter_NoBypassParam);
+      note(Counter_GetListFailed);
       return;
     }
 
@@ -215,20 +252,44 @@ class BypassDirect : public Base
     err = this->GetParameterList(kAudioUnitScope_Global, paramList.data(), paramListSize);
     if (err != noErr)
     {
-      note(Counter_NoBypassParam);
+      note(Counter_GetListFailed);
       return;
     }
 
-    // 遍历参数列表，用 GetParameterInfo 读显示名，比对哈希。
+    // 遍历参数列表。名字只认 cfNameString：name 字段按契约被包装层清零
+    // （wrapasauv2.cpp 的 memset；SDK 注释 "name — UNUSED - set to zero"）。
     for (AudioUnitParameterID paramID : paramList)
     {
       AudioUnitParameterInfo paramInfo;
+      std::memset(&paramInfo, 0, sizeof(paramInfo));
       err = this->GetParameterInfo(kAudioUnitScope_Global, paramID, paramInfo);
-      if (err != noErr) continue;
+      if (err != noErr)
+      {
+        note(Counter_GetInfoFailed);
+        continue;
+      }
+      if (paramInfo.cfNameString == nullptr)
+      {
+        note(Counter_CfNameMissing);
+        continue;
+      }
 
-      // 计算显示名的 FNV-1a 哈希（低 32 位）。
-      uint32_t nameHash = fnv1a_32(paramInfo.name);
-      if (nameHash == BYPASS_DISPLAY_NAME_HASH)
+      // clap-wrapper 对该字段每次都 CFRetain；带 CFNameRelease 标志就必须由我们释放，
+      // 否则每次 Initialize 泄漏 37 个 CFString。
+      const bool release = (paramInfo.flags & kAudioUnitParameterFlag_CFNameRelease) != 0;
+      char nameBuf[256];
+      nameBuf[0] = 0;
+      const Boolean converted = CFStringGetCString(paramInfo.cfNameString, nameBuf, sizeof(nameBuf),
+                                                   kCFStringEncodingUTF8);
+      if (release) CFRelease(paramInfo.cfNameString);
+
+      if (!converted || nameBuf[0] == 0)
+      {
+        note(Counter_CfNameMissing);
+        continue;
+      }
+
+      if (fnv1a_64_low32(nameBuf) == BYPASS_DISPLAY_NAME_HASH)
       {
         fBypassID = paramID;
         break;
@@ -237,7 +298,7 @@ class BypassDirect : public Base
 
     if (fBypassID == CLAP_INVALID_ID)
     {
-      note(Counter_NoBypassParam);
+      note(Counter_NameNoMatch);
       return;
     }
 
@@ -246,16 +307,17 @@ class BypassDirect : public Base
     note(Counter_Armed);
   }
 
-  // FNV-1a 32-bit 哈希（与 hint 模块的 64-bit 哈希低 32 位一致）。
-  static uint32_t fnv1a_32(const char *str)
+  // §245：FNV-1a **64** 的低 32 位——与 hint 模块的 64-bit 实现逐位一致。
+  // （上一版误用 32 位算法：FNV-1a 32("Bypass") = 0x34540dcd ≠ 0x0146944d。）
+  static uint32_t fnv1a_64_low32(const char *str)
   {
-    uint32_t hash = 2166136261u;
+    uint64_t hash = 14695981039346656037ull;
     for (const char *p = str; *p; ++p)
     {
-      hash ^= static_cast<uint8_t>(*p);
-      hash *= 16777619u;
+      hash ^= static_cast<uint64_t>(static_cast<uint8_t>(*p));
+      hash *= 1099511628211ull;
     }
-    return hash;
+    return static_cast<uint32_t>(hash & 0xffffffffull);
   }
 
   void notifyHostIfBypassMoved()
