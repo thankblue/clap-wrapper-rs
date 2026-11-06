@@ -151,6 +151,8 @@ class BypassDirect : public Base
       : Base(clapname, clapid, idx, ci)
   {
     note(Counter_InstancesBuilt);
+    // §245 台架专用开关，构造期（主线程）读一次；见 Render() 的说明。
+    probeNotifyOnRender = std::getenv("NICE_AU_PROBE_NOTIFY_ON_RENDER") != nullptr;
   }
 
   // §239 甲-1：不再依赖 setupWrapperSpecifics 取 clap_plugin_t*（那条路在构造期虚分派，
@@ -199,6 +201,20 @@ class BypassDirect : public Base
       note(Counter_SetPropertyBypassEntered);
     }
     return Base::SetProperty(inID, inScope, inElement, inData, inDataSize);
+  }
+
+  // §245 台架专用（环境变量 NICE_AU_PROBE_NOTIFY_ON_RENDER）：无头宿主里没有 GUI，
+  // 不会产生生产路径的 param_request_flush()。置位时在第一次 Render 之后用**同一个
+  // 生产虚函数**触发一次直发；环境变量未置位＝零行为。产品构建不设它。
+  OSStatus Render(AudioUnitRenderActionFlags &inFlags, const AudioTimeStamp &inTimeStamp,
+                  UInt32 inFrames) override
+  {
+    const OSStatus status = Base::Render(inFlags, inTimeStamp, inFrames);
+    if (probeNotifyOnRender && !probeNotified.exchange(true, std::memory_order_relaxed))
+    {
+      this->param_request_flush();
+    }
+    return status;
   }
 
   // Plugin -> host. nice-plug calls this from the editor's parameter write, on the main thread.
@@ -377,6 +393,9 @@ class BypassDirect : public Base
   std::atomic<bool> fArmed{false};
   std::atomic<double> fHostWriteValue{0.0};
   std::atomic<bool> fHostWriteSeen{true};
+  // §245 台架专用：见 Render()。产品路径永远为 false。
+  bool probeNotifyOnRender{false};
+  std::atomic<bool> probeNotified{false};
 };
 
 } // namespace nice_s238
